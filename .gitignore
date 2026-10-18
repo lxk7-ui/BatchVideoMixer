@@ -1,0 +1,32 @@
+# 本地依赖：Python 虚拟环境、FFmpeg、Inno Setup（见 docs/开发说明.md）
+_deps/
+
+# 工作目录：测试素材与输出、截图、开发态数据
+_work/
+
+# 构建产物与交付物（安装包发布在 GitHub Releases）
+build/
+dist/
+交付/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# Node.js（tools/docx）
+node_modules/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# 程序运行时可能在源码旁生成的文件
+src/data/
+portable.flag
+.write_test*

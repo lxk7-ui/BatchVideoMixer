@@ -1,0 +1,15 @@
+{
+  "name": "batchvideomixer-docx",
+  "version": "1.0.0",
+  "description": "把 docs/ 下的 Markdown 文档生成排版好的 Word 文档",
+  "scripts": {
+    "manual": "node make_manual.js",
+    "quickstart": "node make_quickstart.js"
+  },
+  "license": "MIT",
+  "type": "commonjs",
+  "dependencies": {
+    "docx": "^9.11.0"
+  },
+  "private": true
+}

@@ -1,0 +1,44 @@
+{
+ "点赞按钮.png": {
+  "anim": "pulse"
+ },
+ "关注按钮.png": {
+  "anim": "pulse"
+ },
+ "收藏按钮.png": {
+  "anim": "pulse"
+ },
+ "评论按钮.png": {
+  "anim": ""
+ },
+ "转发按钮.png": {
+  "anim": ""
+ },
+ "购物车按钮.png": {
+  "anim": "pulse"
+ },
+ "一键三连.png": {
+  "anim": "pulse"
+ },
+ "关注不迷路.png": {
+  "anim": ""
+ },
+ "点击下方链接.png": {
+  "anim": "bounce"
+ },
+ "左下角下单.png": {
+  "anim": "bounce"
+ },
+ "评论区见.png": {
+  "anim": ""
+ },
+ "双击屏幕点赞.png": {
+  "anim": ""
+ },
+ "戳这里购买.png": {
+  "anim": "bounce"
+ },
+ "快来抢.png": {
+  "anim": "shake"
+ }
+}

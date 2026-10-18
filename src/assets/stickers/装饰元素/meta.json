@@ -1,0 +1,53 @@
+{
+ "闪光星.png": {
+  "anim": "spin"
+ },
+ "白色闪光.png": {
+  "anim": "pulse"
+ },
+ "粉色闪光.png": {
+  "anim": "spin"
+ },
+ "蓝色闪光.png": {
+  "anim": "pulse"
+ },
+ "放射线.png": {
+  "anim": "pulse"
+ },
+ "红色放射线.png": {
+  "anim": "pulse"
+ },
+ "彩色纸屑.png": {
+  "anim": "float"
+ },
+ "彩色纸屑2.png": {
+  "anim": "float"
+ },
+ "哇.png": {
+  "anim": "pulse"
+ },
+ "绝了.png": {
+  "anim": "pulse"
+ },
+ "好用.png": {
+  "anim": "bounce"
+ },
+ "YYDS.png": {
+  "anim": "pulse"
+ },
+ "真香.png": {
+  "anim": "swing"
+ },
+ "冲.png": {
+  "anim": "shake"
+ },
+ "666.png": {
+  "anim": "pulse"
+ },
+ "划重点.png": {
+  "anim": ""
+ },
+ "干货.png": {
+  "anim": "bounce"
+ }
+}

@@ -1,0 +1,21 @@
+# 文本统一用 LF 存储，检出时按平台转换
+* text=auto
+
+# Windows 专用脚本保持 CRLF
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.iss text eol=crlf
+*.isl text eol=crlf
+
+# 二进制
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.webp binary
+*.ico binary
+*.ttf binary
+*.otf binary
+*.docx binary
+*.exe binary
+*.dll binary

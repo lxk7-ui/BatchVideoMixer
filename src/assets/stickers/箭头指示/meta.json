@@ -1,0 +1,47 @@
+{
+ "箭头右.png": {
+  "anim": "shake"
+ },
+ "箭头左.png": {
+  "anim": "shake"
+ },
+ "箭头上.png": {
+  "anim": "bounce"
+ },
+ "箭头下.png": {
+  "anim": "bounce"
+ },
+ "绿色箭头右.png": {
+  "anim": "shake"
+ },
+ "弧形箭头.png": {
+  "anim": "swing"
+ },
+ "弧形箭头反.png": {
+  "anim": "swing"
+ },
+ "黄色弧形箭头.png": {
+  "anim": "swing"
+ },
+ "手绘圈.png": {
+  "anim": ""
+ },
+ "黄色手绘圈.png": {
+  "anim": ""
+ },
+ "手绘下划线.png": {
+  "anim": ""
+ },
+ "红色下划线.png": {
+  "anim": ""
+ },
+ "向下箭头组.png": {
+  "anim": "bounce"
+ },
+ "向上箭头组.png": {
+  "anim": "bounce"
+ },
+ "向右箭头组.png": {
+  "anim": "shake"
+ }
+}

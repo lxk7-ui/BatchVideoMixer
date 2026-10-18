@@ -1,0 +1,13 @@
+# 运行
+PySide6-Essentials==6.8.3
+numpy==2.5.4
+Pillow==12.3.0
+
+# 打包（tools/build.py）
+pyinstaller==6.22.3
+
+# 文档（tools/make_doc.py 生成 HTML；pymupdf 只用于检查 Word 导出的 PDF 版面）
+Markdown==3.11.1
+pymupdf==1.28.2
+
+# 另需 FFmpeg 8.x（gpl-shared 版），放到 _deps\ffmpeg\，见 docs/开发说明.md
