@@ -52,6 +52,7 @@ class BatchRunner:
         self.dup = None                     # 剪辑前查重索引
         self._solo_dup = {}                 # 复查时按需单独分析的素材索引
         self._src_h = {}                    # 复查确认用：素材原始画面指纹
+        self._plan_changed = False          # 复查时整段移除过素材
         self.batch_dir = None
         self._logfh = None
         self.item_frac = {}
@@ -167,6 +168,77 @@ class BatchRunner:
         except OSError:
             pass
         return idx
+
+    def _render_item(self, item, ctx, out, job_dir, setp, weight_parts):
+        """渲染一条成片的全部片段（交给全局片段线程池并行，单条长成片也能吃满可用 CPU）并合成，返回片段文件列表。"""
+        parts = rd.item_parts(item, ctx)
+        n = len(parts)
+        fracs = [0.0] * n
+        done_n = [0]
+
+        def cbp(fr, k):
+            fracs[k] = fr
+            setp(weight_parts * sum(fracs) / max(1, n), f"渲染片段 {min(n, done_n[0] + 1)}/{n}")
+
+        def job(k, spec):
+            if self.cancel.is_set():
+                raise ffmpeg.Cancelled()
+            f = rd.render_part(spec, ctx, on_progress=lambda fr: cbp(fr, k))
+            done_n[0] += 1
+            return f
+        futs = [self.part_pool.submit(job, k, spec) for k, spec in enumerate(parts)]
+        files = []
+        try:
+            for f in futs:
+                files.append(f.result())
+        except BaseException:
+            for f in futs:
+                f.cancel()
+            raise
+        rd.compose(item, files, out, self.cfg, ctx, job_dir=job_dir,
+                   on_progress=lambda fr: setp(weight_parts + (1 - weight_parts) * 0.9 * fr, "合成成片"))
+        return files
+
+    def _whole_dups(self, item, out, ctx):
+        """整段拼接复查：成片里两个不同素材之间仍有重复画面时，返回要整段移除的素材序号（后出现的那个，
+        片头片尾保留）；同一个素材内部的重复不处理（整段拼接不拆素材）。"""
+        segs = rd.output_segments(item, ctx.fps)
+
+        def seg_at(t):
+            for k, (o0, o1, _s) in enumerate(segs):
+                if o0 <= t < o1:
+                    return k
+            return None
+        fixed = ("opening", "ending")
+        drop = set()
+        for r in dedup.check_output(probe.probe(out, use_cache=False), self.cfg.dedup_level):
+            ka, kb = seg_at((r[0] + r[1]) / 2), seg_at((r[2] + r[3]) / 2)
+            if ka is None or kb is None or ka == kb or not self._real_dup(segs, r):
+                continue
+            later, other = max(ka, kb), min(ka, kb)
+            if segs[later][2].kind in fixed:
+                later = other
+            if segs[later][2].kind not in fixed:
+                drop.add(later)
+        if len(drop) >= len(segs) - sum(1 for _a, _b, s in segs if s.kind in fixed):
+            return []   # 全移除就没有内容了，保留原样
+        return sorted(drop)
+
+    @staticmethod
+    def _drop_segments(item, drop, fps):
+        """从成片计划里整段移除若干素材（相邻处沿用原来的转场），并更新时长。"""
+        from .planner import Seg, total_frames
+        keep = [k for k in range(len(item.segments)) if k not in drop]
+        trans = list(item.transitions or [])
+        new_trans = []
+        for a, b in zip(keep, keep[1:]):
+            k = a if b == a + 1 else b - 1
+            new_trans.append(trans[k] if k < len(trans) else "")
+        item.segments = [item.segments[k] for k in keep]
+        item.transitions = new_trans
+        nfr = total_frames([Seg(**x) for x in item.segments], new_trans, item.trans_frames,
+                           getattr(item, "trans_hold", False))
+        item.duration = round(nfr / float(fps), 3)
 
     def _index_for(self, pa, pb):
         """包含这两个素材的查重索引：优先用剪辑前查重的结果；没有时（关闭了剪辑前查重、断点续跑、片头片尾）
@@ -414,8 +486,6 @@ class BatchRunner:
         if self.soft.is_set():
             return "skipped", None
         t0 = time.time()
-        parts = rd.item_parts(item, ctx)
-        n = len(parts)
         weight_parts = 0.55
         self.emit("item", index=item.index, name=name, status="running", stage="准备", pct=0.0)
         last = [0.0]
@@ -427,36 +497,25 @@ class BatchRunner:
                 last[0] = f
                 self.emit("item", index=item.index, name=name, status="running", stage=stage, pct=f)
                 self._progress()
-        # 片段交给全局片段线程池并行渲染（单条长成片也能吃满 CPU）
-        fracs = [0.0] * n
-        done_n = [0]
-
-        def cbp(fr, k):
-            fracs[k] = fr
-            setp(weight_parts * sum(fracs) / max(1, n), f"渲染片段 {min(n, done_n[0] + 1)}/{n}")
-
-        def job(k, spec):
-            if self.cancel.is_set():
-                raise ffmpeg.Cancelled()
-            f = rd.render_part(spec, ctx, on_progress=lambda fr: cbp(fr, k))
-            done_n[0] += 1
-            return f
-        futs = [self.part_pool.submit(job, k, spec) for k, spec in enumerate(parts)]
-        files = []
-        try:
-            for f in futs:
-                files.append(f.result())
-        except BaseException:
-            for f in futs:
-                f.cancel()
-            raise
         job_dir = self._p("_tmp", "jobs", f"{item.index:04d}")
-        rd.compose(item, files, out, cfg, ctx, job_dir=job_dir,
-                   on_progress=lambda fr: setp(weight_parts + (1 - weight_parts) * 0.9 * fr, "合成成片"))
+        files = self._render_item(item, ctx, out, job_dir, setp, weight_parts)
+        n = len(files)
+        extra_files = []
         if cfg.dedup_postcheck:
             setp(weight_parts + (1 - weight_parts) * 0.92, "成片复查")
             try:
-                self._postcheck(item, out, ctx)
+                if cfg.mode == "whole":
+                    drop = self._whole_dups(item, out, ctx)
+                    if drop:
+                        names = "、".join(os.path.basename(item.segments[k]["src"]) for k in drop)
+                        self._drop_segments(item, drop, ctx.fps)
+                        self._plan_changed = True
+                        self.log(f"成片复查：{name} 中素材「{names}」与前面的素材有重复画面，已整段移除并重新合成"
+                                 f"（整段拼接不拆素材），时长 {item.duration:.1f}s")
+                        extra_files = [f for f in self._render_item(item, ctx, out, job_dir, setp, weight_parts)
+                                       if f not in files]
+                else:
+                    self._postcheck(item, out, ctx)
             except ffmpeg.Cancelled:
                 raise
             except Exception as e:  # 复查失败不影响成片
@@ -484,6 +543,12 @@ class BatchRunner:
                             os.remove(f)
                         except OSError:
                             pass
+                for f in extra_files:   # 复查重新合成时新增、别的成片用不到的片段
+                    if f not in refcount:
+                        try:
+                            os.remove(f)
+                        except OSError:
+                            pass
         return "ok", {"file": out, "cover": cover, "elapsed": round(elapsed, 1), "parts": n}
 
     def run(self):
@@ -505,14 +570,17 @@ class BatchRunner:
             npar = utils.recommend_part_workers(W, H, conc)
             threads = utils.threads_per_job(npar)
             self.part_pool = ThreadPoolExecutor(max_workers=npar)
+            mode = ffmpeg.PERF_MODES.get(ffmpeg.perf_mode(), {})
             self.log(f"画布 {W}×{H} @{cfg.fps}fps，编码器：{enc.enc}，并发 {conc} 条成片，片段并行 {npar} 路"
-                     f"（每路 {threads} 线程）")
+                     f"（每路 {threads} 线程），电脑负载：{mode.get('label', '')}"
+                     + (f"（CPU 最多 {int(mode.get('cpu', 1) * 100)}%）" if mode.get("cpu", 1) < 1 else ""))
             # 磁盘空间预估
             est_gb = sum(p.duration for p in self.plans) * 1.3 / 1024 + 1.0
             free = utils.free_disk_gb(self.batch_dir)
             if free < est_gb:
                 self.log(f"! 磁盘剩余 {free:.1f}GB，预计需要约 {est_gb:.1f}GB，可能不足", level="warn")
             ctx = self._ctx(enc, threads)
+            ctx.final_threads = utils.final_threads(conc)
             todo = []
             for it in self.plans:
                 m = self.manifest.get(it.name)
@@ -590,6 +658,10 @@ class BatchRunner:
             if not self.cfg.keep_temp and not stopped and self.failed == 0:
                 shutil.rmtree(self._p("_tmp"), ignore_errors=True)
             self._write_report()
+            if self._plan_changed:   # 复查整段移除过素材：计划文件同步成实际成片
+                plan = load_json(self._p("数据", "plan.json"), {}) or {}
+                plan["items"] = [p.to_dict() for p in self.plans]
+                save_json(self._p("数据", "plan.json"), plan)
             elapsed = time.time() - t_start
             msg = f"任务结束：成功 {self.done} 条，失败 {self.failed} 条" + \
                   (f"，未完成 {self.skipped} 条（可在“任务记录”中继续）" if self.skipped else "") + \

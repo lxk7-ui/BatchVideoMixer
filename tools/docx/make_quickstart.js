@@ -10,7 +10,7 @@ const ROOT = path.resolve(__dirname, "..", "..");
 const DOCS = path.join(ROOT, "docs");
 const MD = path.join(DOCS, "上手文档.md");
 const OUT = process.argv[2] || path.join(ROOT, "交付", "上手文档.docx");
-const VER = "1.1.0";
+const VER = "1.2.0";
 
 async function main() {
   const body = parseMarkdown(fs.readFileSync(MD, "utf8"), DOCS);

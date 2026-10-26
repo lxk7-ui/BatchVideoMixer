@@ -9,6 +9,7 @@ DEFAULTS = {
     "ffmpeg_dir": "",
     "output_root": "",
     "low_priority": True,
+    "perf_mode": "",          # smooth 流畅优先 / balanced 均衡 / fast 速度优先；空 = 按旧的 low_priority
     "default_encoder": "auto",
     "studio_out_dir": "",
     "last_config": None,
@@ -50,7 +51,12 @@ def set(key, value, persist=True):  # noqa: A001
 def apply():
     s = get()
     ffmpeg.set_custom_dir(s.get("ffmpeg_dir") or None)
-    ffmpeg.set_low_priority(bool(s.get("low_priority", True)))
+    ffmpeg.set_perf_mode(perf_mode())
+
+
+def perf_mode():
+    s = get()
+    return s.get("perf_mode") or ("smooth" if s.get("low_priority", True) else "fast")
 
 
 def output_root():

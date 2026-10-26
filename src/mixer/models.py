@@ -187,7 +187,7 @@ class MixConfig(Model):
     cleanup_map: dict = field(default_factory=dict)     # 素材路径 -> CleanupProfile dict
 
     count: int = 10
-    mode: str = "segment"           # segment 片段混剪 / whole 整段拼接
+    mode: str = "whole"             # whole 整段拼接（素材完整、随机顺序拼接）/ segment 片段混剪（拆成片段）
     limit_enabled: bool = True
     limit_minutes: float = 1.0      # 成片时长上限（分钟）
     limit_float: int = 20           # 随机浮动百分比：成片时长在 [上限×(1-浮动), 上限] 之间
@@ -195,7 +195,7 @@ class MixConfig(Model):
     seg_max: float = 5.0
     clips_min: int = 1
     clips_max: int = 3
-    trim_overflow: bool = True      # 整段模式：超出上限的素材自动截断
+    trim_overflow: bool = False     # 整段模式：放不下的素材截掉结尾凑满时长（默认不截，只用完整素材）
     use_scenes: bool = True         # 按镜头切点取片段
     allow_repeat: bool = True       # 素材不足时允许重复使用片段
     avoid_similar: bool = True      # 成片相似度控制
@@ -251,6 +251,7 @@ class MixConfig(Model):
     concurrency: int = 0            # 0 = 自动
     seed: int = 0                   # 0 = 每次随机
     keep_temp: bool = False
+    cfg_ver: int = 2                # 配置版本：2 = v1.2（默认整段拼接）
 
     def style_obj(self):
         return StylePreset.from_dict(self.style)

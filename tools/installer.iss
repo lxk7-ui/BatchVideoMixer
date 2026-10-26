@@ -2,7 +2,7 @@
 #define AppName "批量视频混剪工具"
 #define AppExe "批量视频混剪工具.exe"
 #ifndef AppVer
-  #define AppVer "1.1.0"
+  #define AppVer "1.2.0"
 #endif
 ; 简体中文语言文件随仓库提供（tools/ChineseSimplified.isl，官方安装版的 Inno Setup 不自带）
 #ifndef LangFile

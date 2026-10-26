@@ -49,9 +49,17 @@ def memory_gb():
         return 8.0, 4.0
 
 
-def recommend_concurrency(W=1080, H=1920, gpu=False):
-    """并发推荐：按 CPU 核数与可用内存自适应，限制 1~4。"""
+def cpu_budget():
+    """按“生成时电脑负载”设置，可用于渲染的 CPU 线程数（流畅优先约 60%，均衡约 80%，速度优先全部）。"""
+    from . import ffmpeg
     cores = os.cpu_count() or 4
+    frac = ffmpeg.PERF_MODES.get(ffmpeg.perf_mode(), {}).get("cpu", 1.0)
+    return max(1, int(round(cores * frac)))
+
+
+def recommend_concurrency(W=1080, H=1920, gpu=False):
+    """并发推荐：按可用 CPU（负载设置）与可用内存自适应，限制 1~4。"""
+    cores = cpu_budget()
     base = max(1, min(4, cores // 4))
     if W * H > 1920 * 1080 * 1.5:
         base = max(1, base - 1)
@@ -65,17 +73,23 @@ def recommend_concurrency(W=1080, H=1920, gpu=False):
 
 def recommend_part_workers(W=1080, H=1920, concurrency=1):
     """片段渲染并行数：按核数（每路约 3~4 线程）与可用内存（每路约 0.6GB@1080p）自适应，限制 2~8。"""
-    cores = os.cpu_count() or 4
-    n = max(2, min(8, cores // 3))
+    cores = cpu_budget()
+    n = max(1, min(8, cores // 3))
     _, avail = memory_gb()
     per = 0.6 if W * H <= 1920 * 1080 else 1.1
-    n = max(1, min(n, int(max(1.0, avail - 0.5) / per)))
-    return max(n, min(2, concurrency))
+    return max(1, min(n, int(max(1.0, avail - 0.5) / per)))
 
 
 def threads_per_job(concurrency):
-    cores = os.cpu_count() or 4
-    return max(2, min(16, cores // max(1, concurrency)))
+    return max(1, min(16, cpu_budget() // max(1, concurrency)))
+
+
+def final_threads(concurrency):
+    """最终合成每路的线程数：速度优先时不限制（0），其余按可用 CPU 平分。"""
+    from . import ffmpeg
+    if ffmpeg.perf_mode() == "fast":
+        return 0
+    return max(2, cpu_budget() // max(1, concurrency))
 
 
 def open_path(path, select=False):

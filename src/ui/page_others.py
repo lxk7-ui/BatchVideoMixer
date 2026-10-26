@@ -272,10 +272,16 @@ class SettingsPage(QWidget):
         self.enc_default.currentIndexChanged.connect(
             lambda *_: settings.set("default_encoder", self.enc_default.currentData()))
         c.add(form_row("素材处理导出", self.enc_default))
-        self.lowprio = QCheckBox("后台低优先级运行（批量生成时电脑不卡，速度略慢）")
-        self.lowprio.setChecked(bool(s.get("low_priority", True)))
-        self.lowprio.toggled.connect(self._lowprio)
-        c.add(self.lowprio)
+        self.perf = QComboBox()
+        for key, label in (("smooth", "流畅优先（推荐）：生成时电脑基本不卡，速度稍慢"),
+                           ("balanced", "均衡：速度和流畅兼顾"),
+                           ("fast", "速度优先：生成最快，电脑会比较卡")):
+            self.perf.addItem(label, key)
+        self.perf.setCurrentIndex(max(0, self.perf.findData(settings.perf_mode())))
+        self.perf.currentIndexChanged.connect(lambda *_: self._perf())
+        c.add(form_row("生成时电脑负载", self.perf))
+        c.add(hint("流畅优先：所有生成任务合计最多用约 60% 的 CPU，并调低优先级、内存和磁盘读写优先级，"
+                   "长时间批量生成时照常办公不卡；均衡约 80%；速度优先不限制。"))
         root.addWidget(c)
         c2 = Card("外观与数据")
         self.theme = QComboBox()
@@ -348,8 +354,8 @@ class SettingsPage(QWidget):
         self.enc_label.setText("正在检测（实际试编码）…")
         run_bg(lambda: encoders.detect(force=True), on_done=lambda r: self.enc_label.setText(encoders.describe(r)))
 
-    def _lowprio(self, on):
-        settings.set("low_priority", bool(on))
+    def _perf(self):
+        settings.set("perf_mode", self.perf.currentData())
         settings.apply()
 
     def _theme(self):
@@ -377,7 +383,7 @@ HELP_HTML = """
 <h2>快速上手（3 步）</h2>
 <ol>
 <li><b>导入素材</b>：在“混剪生产”页把视频/图片（或整个文件夹）拖进素材列表。可在左下角添加片头、片尾、背景音乐、产品角标。</li>
-<li><b>设置参数</b>：选择<b>片段混剪</b>（推荐）或整段拼接；在“时长控制”里填<b>不超过 X 分钟</b>和随机浮动。
+<li><b>设置参数</b>：混剪模式默认<b>整段拼接</b>（素材完整保留、随机顺序拼接，不拆分），需要拆成片段时选片段混剪；在“时长控制”里填<b>不超过 X 分钟</b>和随机浮动。
 画面/包装/音频/输出四个标签里可设置尺寸、转场、滤镜、标题、贴纸、背景音乐等。</li>
 <li><b>开始生成</b>：点右下角“开始生成”，右侧会显示每条进度和日志。完成后点“打开输出文件夹”。</li>
 </ol>
@@ -401,14 +407,14 @@ HELP_HTML = """
 <li>素材本身是剪辑拼接过的、同一段画面出现在多个素材里、同一视频重复导入，都能自动识别；
 转码、调色、加字幕、镜像、加黑边、横屏改竖屏后的同一画面也能认出。</li>
 <li><b>剪辑前查重</b>：同一条成片里，同一段画面只会出现一次；几乎完全相同的素材只保留一份。</li>
-<li><b>剪辑后复查</b>：成片生成后再抽帧检查，找到的相似画面会对照素材原始画面确认，确实重复的片段自动剪掉（成片只会变短，不会超过时长上限）。</li>
+<li><b>剪辑后复查</b>：成片生成后再抽帧检查，找到的相似画面会对照素材原始画面确认，确实重复时自动去掉——整段拼接是整段移除重复的素材，不拆素材（成片只会变短，不会超过时长上限）。</li>
 <li>点素材栏的“<b>检查重复</b>”可查看重复报告；素材列表的“重复”列显示每个素材的重复画面占比。</li>
 <li>灵敏度一般用“标准”；素材互相搬运、改动大时用“严格”；同一场景的口播素材觉得限制太多、成片偏短时用“宽松”。</li>
 </ul>
 <h2>常见问题</h2>
 <ul>
 <li><b>速度慢？</b> 在“输出”里选择显卡编码（NVIDIA/Intel/AMD，自动检测可用性，失败自动回退 CPU）；并行数量保持“自动”。</li>
-<li><b>电脑卡？</b> 设置里开启“后台低优先级运行”。</li>
+<li><b>电脑卡？</b> 设置 →“生成时电脑负载”选“流畅优先”（默认）：生成任务合计最多用约 60% 的 CPU，照常办公不卡。</li>
 <li><b>中途关机/停止了？</b> 到“任务记录”选中任务，点“继续未完成”，已完成的不会重做。</li>
 <li><b>成片太像？</b> 用片段混剪、增加素材数量、开启“避免成片雷同”、随机滤镜、转场、变速。</li>
 <li><b>成片偏短？</b> 素材不够，或素材里重复画面太多（防重复会跳过重复部分）：增加素材，或把防重复灵敏度调为“宽松”。</li>

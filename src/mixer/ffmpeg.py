@@ -182,6 +182,7 @@ def _get_job():
             info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
             info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
             kernel32.SetInformationJobObject(h, 9, ctypes.byref(info), ctypes.sizeof(info))
+            _apply_cpu_cap(h)
             _job_handle = h
         except Exception:
             _job_handle = 0
@@ -200,21 +201,78 @@ def _assign_to_job(proc):
 
 
 # ----------------------------------------------------------------------------
-# 低优先级（批量跑时不卡电脑）
+# 生成时的电脑负载（批量跑时不卡电脑）
 # ----------------------------------------------------------------------------
 BELOW_NORMAL_PRIORITY_CLASS = 0x00004000
-_low_priority = False
+IDLE_PRIORITY_CLASS = 0x00000040
+PERF_MODES = {
+    # cpu：全部 ffmpeg 进程合计最多占用的 CPU 比例（Windows 作业对象硬上限，界面和其他软件始终有余量）
+    # priority：进程优先级；background：同时调低内存和磁盘读写优先级，减少卡顿
+    "smooth": {"label": "流畅优先", "cpu": 0.6, "priority": IDLE_PRIORITY_CLASS, "background": True},
+    "balanced": {"label": "均衡", "cpu": 0.8, "priority": BELOW_NORMAL_PRIORITY_CLASS, "background": True},
+    "fast": {"label": "速度优先", "cpu": 1.0, "priority": BELOW_NORMAL_PRIORITY_CLASS, "background": False},
+}
+_perf_mode = "smooth"
+
+
+def set_perf_mode(mode: str):
+    global _perf_mode
+    _perf_mode = mode if mode in PERF_MODES else "smooth"
+    h = _get_job()
+    if h:
+        _apply_cpu_cap(h)
+
+
+def perf_mode():
+    return _perf_mode
 
 
 def set_low_priority(flag: bool):
-    global _low_priority
-    _low_priority = bool(flag)
+    """兼容旧设置：开 = 流畅优先，关 = 速度优先。"""
+    set_perf_mode("smooth" if flag else "fast")
+
+
+def _apply_cpu_cap(h):
+    """给作业对象设置 CPU 总占用硬上限（Windows 8 及以上；速度优先时取消上限）。"""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class CPU_RATE_CONTROL(ctypes.Structure):
+            _fields_ = [("ControlFlags", wintypes.DWORD), ("CpuRate", wintypes.DWORD)]
+        frac = PERF_MODES[_perf_mode]["cpu"]
+        info = CPU_RATE_CONTROL()
+        if frac < 0.999:
+            info.ControlFlags = 0x1 | 0x4      # JOB_OBJECT_CPU_RATE_CONTROL_ENABLE | HARD_CAP
+            info.CpuRate = max(100, min(10000, int(frac * 10000)))
+        ctypes.windll.kernel32.SetInformationJobObject(wintypes.HANDLE(h), 15, ctypes.byref(info),
+                                                      ctypes.sizeof(info))
+    except Exception:
+        pass
+
+
+def _lower_io_memory(proc):
+    """流畅 / 均衡模式：把子进程的内存优先级和磁盘读写优先级调低（失败不影响运行）。"""
+    if os.name != "nt" or not PERF_MODES[_perf_mode]["background"]:
+        return
+    try:
+        import ctypes
+        from ctypes import wintypes
+        h = wintypes.HANDLE(int(proc._handle))
+        mem = wintypes.ULONG(2)                # MEMORY_PRIORITY_LOW
+        k32 = ctypes.windll.kernel32
+        k32.SetProcessInformation.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+        k32.SetProcessInformation(h, 0, ctypes.byref(mem), ctypes.sizeof(mem))      # ProcessMemoryPriority
+        io = wintypes.ULONG(1)                 # IoPriorityLow
+        ctypes.windll.ntdll.NtSetInformationProcess(h, 33, ctypes.byref(io), ctypes.sizeof(io))  # ProcessIoPriority
+    except Exception:
+        pass
 
 
 def _creationflags():
     f = CREATE_NO_WINDOW
-    if _low_priority and os.name == "nt":
-        f |= BELOW_NORMAL_PRIORITY_CLASS
+    if os.name == "nt":
+        f |= PERF_MODES[_perf_mode]["priority"]
     return f
 
 
@@ -230,6 +288,7 @@ def run_capture(args, timeout=120, cwd=None, text=True):
     except FileNotFoundError as e:
         raise FFmpegError(f"无法启动：{e}", cmd=args, category="环境")
     _assign_to_job(p)
+    _lower_io_memory(p)
     try:
         out, err = p.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -277,6 +336,7 @@ def run_ffmpeg(args, duration=None, on_progress=None, cancel=None, cwd=None,
     except FileNotFoundError as e:
         raise FFmpegError(f"无法启动 ffmpeg：{e}", cmd=cmd, category="环境")
     _assign_to_job(proc)
+    _lower_io_memory(proc)
 
     state = {"last": time.time(), "frac": 0.0}
     err_tail = collections.deque(maxlen=200)

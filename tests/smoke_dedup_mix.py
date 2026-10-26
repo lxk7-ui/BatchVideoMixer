@@ -3,6 +3,7 @@
 判定（与软件“剪辑后复查”同一标准）：复查找到的相似画面逐个采样点换算回素材时刻，对照素材原始画面确认——
 同一素材同一时刻、查重索引认定的同一画面、或不同素材原始指纹确实相近，才算“真重复”；
 同一素材不同时刻的相似画面（口播、固定机位）、画布模糊背景/贴纸标题造成的“看起来像”不算。
+整段拼接（whole）不拆素材：同一个素材内部的重复不算；复查发现不同素材之间重复时整段移除后出现的素材并重新合成。
 用法：python tests/smoke_dedup_mix.py segment|whole
 """
 import os, sys, glob, time, json
@@ -22,13 +23,19 @@ def ev(e, d):
 JUDGE = BatchRunner(MixConfig(materials=mats, dedup_level="standard"), record_history=False)
 JUDGE.infos = {p: probe.probe(p) for p in mats}
 JUDGE.dup = IDX
-def is_real(segs, *r):
+REMOVED = []
+def is_real(segs, *r, whole=False):
+    if whole:   # 整段拼接：同一个素材内部的重复不算（素材不拆分）
+        idx = [next((k for k, (o0, o1, _s) in enumerate(segs) if o0 <= t < o1), None) for t in ((r[0] + r[1]) / 2, (r[2] + r[3]) / 2)]
+        if idx[0] is None or idx[0] == idx[1]:
+            return False
     return JUDGE._real_dup(segs, r)
-def run(mode, on, count):
-    cfg = MixConfig(name=f"{mode}_{'查重' if on else '不查重'}", materials=mats, count=count, mode=mode,
+def run(mode, on, count, post=False):
+    tag = ("查重" if on else "不查重") + ("_复查" if post else "")
+    cfg = MixConfig(name=f"{mode}_{tag}", materials=mats, count=count, mode=mode,
                     limit_enabled=(mode == "segment"), limit_minutes=0.5, limit_float=10, seg_min=2, seg_max=4,
                     clips_min=3, clips_max=5, canvas="540x960", fps=25, output_root=OUT, cover=False,
-                    transition_mode="none", dedup_enabled=on, dedup_postcheck=False, encoder="cpu", seed=12345)
+                    transition_mode="none", dedup_enabled=on, dedup_postcheck=post, encoder="cpu", seed=12345)
     # 复查单独做：先生成未复查的成片做判定（换算需要原时间轴），复查效果由下面的 postcheck 统计
     t = time.time(); res = BatchRunner(cfg, callback=ev, record_history=False).run()
     plan = json.load(open(os.path.join(res["dir"], "数据", "plan.json"), encoding="utf-8"))
@@ -39,11 +46,11 @@ def run(mode, on, count):
         it = items[os.path.splitext(os.path.basename(f))[0]]
         segs = rd.output_segments(it, cfg.fps)
         reps = dedup.check_output(info, "standard")
-        real = [r for r in reps if is_real(segs, *r)]
+        real = [r for r in reps if is_real(segs, *r, whole=(mode == "whole"))]
         sec = sum(b1 - b0 for _, _, b0, b1 in real)
         bad += bool(real); total_dup += sec; raw_n += len(reps); durs.append(info.duration)
         print(f"   {os.path.basename(f)} {info.duration:5.1f}s  真重复 {len(real)} 处 {sec:.1f}s（相似 {len(reps)} 处） {real[:3]}")
-    print(f"== {mode} 查重={'开' if on else '关'}: {res.get('ok')} 条，含真重复 {bad} 条，真重复总时长 {total_dup:.1f}s，"
+    print(f"== {mode} {tag}: {res.get('ok')} 条，含真重复 {bad} 条，真重复总时长 {total_dup:.1f}s，"
           f"相似画面 {raw_n} 处，时长 {min(durs):.1f}~{max(durs):.1f}s，用时 {time.time()-t:.0f}s")
     return bad, res["dir"], cfg, items
 def postcheck(dir_, cfg, items, dup):
@@ -70,6 +77,18 @@ def postcheck(dir_, cfg, items, dup):
 mode = sys.argv[1]
 b_off, d_off, cfg_off, items_off = run(mode, False, 6)
 b_on, d_on, cfg_on, items_on = run(mode, True, 6)
+if mode == "whole":
+    def ev2(e, d, _orig=ev):
+        _orig(e, d)
+        if e == "log" and "整段移除" in d["msg"]:
+            REMOVED.append(d["msg"])
+    ev_old, ev = ev, ev2
+    print("-- 只开剪辑后复查：不同素材之间的重复要整段移除（素材不拆分），最终成片不再含不同素材间的重复")
+    b_post, _, _, _ = run(mode, False, 6, post=True)
+    ev = ev_old
+    print("RESULT", mode, "off:", b_off, "on:", b_on, "post:", b_post, f"整段移除 {len(REMOVED)} 次",
+          "PASS" if b_on == 0 and b_off > 0 and b_post == 0 and REMOVED else "CHECK")
+    sys.exit(0)
 print("-- 开启剪辑前查重后的成片，再复查（应删除 0 秒）")
 cut_on = postcheck(d_on, cfg_on, items_on, IDX)
 print("-- 只开剪辑后复查：在未查重的成片上复查（应删除真重复，且无“仍有重复”警告）")

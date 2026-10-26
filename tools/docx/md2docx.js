@@ -113,7 +113,9 @@ function parseMarkdown(md, baseDir) {
     }
     m = t.match(/^\*([^*].*)\*$/);
     if (m) { out.push(new Paragraph({ style: "Caption2", children: K.inline(m[1]) })); i++; continue; }
-    out.push(new Paragraph({ children: K.inline(t), spacing: { after: 100 } }));
+    // 整行加粗（如常见问题里的“问：…”）与下一段同页，避免问题和回答被分开
+    const boldLine = /^\*\*[^*]+\*\*$/.test(t);
+    out.push(new Paragraph({ children: K.inline(t), spacing: { after: 100 }, keepNext: boldLine }));
     inNumbered = false;
     i++;
   }

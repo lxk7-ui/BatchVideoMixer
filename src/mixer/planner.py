@@ -41,6 +41,7 @@ class PlanItem:
     segments: List[dict] = field(default_factory=list)
     transitions: List[str] = field(default_factory=list)   # 每个边界：xfade 类型或 ""
     trans_frames: int = 0
+    trans_hold: bool = False    # True：整段拼接的定格过渡，相邻素材不重叠，两段之间多出转场时长
     seed: int = 0
     filter_name: str = ""
     bgm: str = ""
@@ -63,10 +64,16 @@ class PlanItem:
         return cls(**{k: v for k, v in d.items() if k in names})
 
 
-def total_frames(segs, transitions, trans_frames):
+def total_frames(segs, transitions, trans_frames, hold=False):
+    """成片总帧数：叠化转场时相邻片段重叠（减去转场帧），定格过渡时两段之间多出转场帧。"""
     n = sum(s.frames for s in segs)
-    n -= trans_frames * sum(1 for t in transitions if t)
-    return n
+    k = sum(1 for t in transitions if t)
+    return n + trans_frames * k if hold else n - trans_frames * k
+
+
+# 整段拼接不用“切换特效”（会盖住下一个素材开头的画面），换成效果相近的定格过渡
+EFFECT_TO_XFADE = {"flash_white": "fadewhite", "flash_black": "fadeblack", "zoom_punch": "zoomin",
+                   "shake": "fade", "blur_in": "hblur"}
 
 
 _bad_chars = re.compile(r'[\\/:*?"<>|\r\n\t]+')
@@ -366,7 +373,29 @@ class Planner:
             add(end_seg, tr)
         return segs, trans
 
+    def _whole_transition(self, rng):
+        """整段拼接的转场：一律做成定格过渡（不吃素材画面）；“切换特效”换成效果相近的过渡。"""
+        tr = self._choose_transition(rng)
+        if tr and tr[0] == "effect":
+            return ("xfade", EFFECT_TO_XFADE.get(tr[1], "fade"))
+        return tr
+
+    def _whole_frames(self, m, rng):
+        """整段拼接里一个素材的 (起点秒, 帧数)：完整时长（只扣掉用户设置的掐头去尾）。"""
+        if m.kind == "image":
+            return 0.0, self._image_frames(rng)
+        head = max(0.0, float(self.cfg.trim_head or 0))
+        tail = max(0.0, float(self.cfg.trim_tail or 0))
+        if m.duration - head - tail < 1.0:
+            head = tail = 0.0
+        return head, max(1, int(math.floor((m.duration - head - tail) * self.fps + 1e-6)))
+
     def _plan_whole_mode(self, rng, target_frames):
+        """整段拼接：素材一律完整使用（不拆片段），随机顺序拼接。
+        - 时长上限：只挑放得下的完整素材；一个都放不下时才截取开头那一段（保留素材开头画面）。
+        - 每条素材数是参考值：挑够了但成片还没到时长下限，会继续加放得下的素材。
+        - 查重：素材里有和本条已用画面重复的内容时，整个素材跳过，不从中间挖掉。
+        - 转场是定格过渡：不和素材重叠，素材首尾画面一帧不少，成片多出转场时长（计入上限）。"""
         cfg = self.cfg
         fps = self.fps
         T = self.trans_frames
@@ -376,135 +405,81 @@ class Planner:
         def add(seg, tr):
             nonlocal used
             if segs:
-                if tr and tr[0] == "xfade":
+                if tr and tr[0] == "xfade" and T > 0:
                     trans.append(tr[1])
-                    used += seg.frames - T
+                    used += T
                 else:
                     trans.append("")
-                    if tr and tr[0] == "effect":
-                        seg.effect = tr[1]
-                    used += seg.frames
-            else:
-                used += seg.frames
+            used += seg.frames
             segs.append(seg)
+
+        def frames_of(m):
+            if m.kind == "image":
+                return 0.0, self._image_frames(rng)
+            return self._whole_frames(m, rng)
+
+        def ids_of(src, a, b):
+            return self.dup.ids_in(src, a, b) if self.dup is not None else set()
 
         unlimited = target_frames <= 0
         cap = target_frames if not unlimited else 10 ** 9
+        lo = 0 if unlimited else min(cap, self._lo_frames)
         if self.openings:
             op = rng.choice(self.openings) if cfg.opening_random else self.openings[self._idx % len(self.openings)]
-            n = min(self._clip_frames(op, rng), cap)
-            add(Seg(op.path, self._usable_range(op)[0] if op.kind == "video" else 0.0, n, 1.0,
-                    "opening" if op.kind == "video" else "image"), None)
+            a0, n = frames_of(op)
+            n = min(n, cap)
+            if n > 0:
+                add(Seg(op.path, a0, n, 1.0, "opening" if op.kind == "video" else "image"), None)
         end_seg = None
         if self.endings:
             ed = rng.choice(self.endings) if cfg.opening_random else self.endings[self._idx % len(self.endings)]
-            n = min(self._clip_frames(ed, rng), max(0, cap - used))
+            a0, n = frames_of(ed)
+            n = min(n, max(0, cap - used))
             if n >= int(fps * 0.5):
-                end_seg = Seg(ed.path, 0.0, n, 1.0, "ending" if ed.kind == "video" else "image")
-        budget = cap - (end_seg.frames if end_seg else 0)
+                end_seg = Seg(ed.path, a0, n, 1.0, "ending" if ed.kind == "video" else "image")
+        budget = cap - (end_seg.frames + T if end_seg else 0)
+        item_used = set()
+        for sg in segs + ([end_seg] if end_seg else []):
+            item_used |= ids_of(sg.src, sg.start, sg.start + sg.src_dur(fps) if sg.kind != "image" else 0.5)
         kmin = max(1, int(cfg.clips_min or 1))
         kmax = max(kmin, int(cfg.clips_max or kmin))
         k = rng.randint(kmin, kmax)
         order = sorted(self.pool, key=lambda m: self.use_count.get(m.path, 0) + rng.random() * 0.9)
         picked = 0
-        item_used = set()
-        if self.dup is not None:
-            for sg in segs + ([end_seg] if end_seg else []):
-                item_used |= self.dup.ids_in(sg.src, sg.start, sg.start + sg.src_dur(fps) if sg.kind != "image" else 0.5)
         for m in order:
-            if picked >= k:
+            if picked >= k and (unlimited or used >= lo):
                 break
-            if self.dup is not None and m.kind == "video":
-                pieces = self._clean_pieces(m, rng, item_used, budget - used, segs, trans, T)
-                if not pieces:
-                    continue
-                for seg, tr in pieces:
-                    add(seg, tr)
-                    item_used |= self.dup.ids_in(seg.src, seg.start, seg.start + seg.src_dur(fps))
-                picked += 1
-                continue
-            if self.dup is not None and m.kind == "image" and self.dup.ids_in(m.path, 0.0, 0.5) & item_used:
-                continue
-            n = self._clip_frames(m, rng)
-            tr = self._choose_transition(rng) if segs else None
-            ov = T if (tr and tr[0] == "xfade") else 0
-            room = budget - used + ov
-            if n <= room:
-                pass
-            elif cfg.trim_overflow and picked < kmin and room >= max(int(fps * 1.0), MIN_BODY_FRAMES + 2 * T):
-                n = room
-            else:
-                continue
-            if n <= 0:
-                continue
-            start = self._usable_range(m)[0] if m.kind == "video" else 0.0
-            seg = Seg(m.path, start, n, 1.0, "clip" if m.kind == "video" else "image")
-            if ov:
-                prev_seg = segs[-1]
-                left_ov = T if (len(trans) and trans[-1]) else 0
-                if prev_seg.frames < left_ov + T + MIN_BODY_FRAMES or seg.frames < 2 * T + MIN_BODY_FRAMES:
-                    tr = None
-                    seg.frames = min(seg.frames, budget - used)
-                    if seg.frames < int(fps * 0.5):
-                        continue
-            add(seg, tr)
-            if self.dup is not None:
-                item_used |= self.dup.ids_in(seg.src, seg.start, seg.start + 0.5)
+            a0, n = frames_of(m)
+            ids = ids_of(m.path, a0, a0 + n / float(fps) if m.kind == "video" else 0.5)
+            if ids & item_used:
+                continue          # 与本条已用画面重复：整个素材跳过，不拆素材
+            tr = self._whole_transition(rng) if segs else None
+            extra = T if (tr and tr[0] == "xfade" and T > 0) else 0
+            room = budget - used
+            if n + extra > room:
+                if extra and n <= room:
+                    tr, extra = None, 0       # 放得下素材、放不下转场：这里改成硬切
+                elif cfg.trim_overflow and room - extra >= int(fps * 1.0):
+                    n = room - extra          # 用户允许截断：截掉这个素材的结尾凑满时长
+                else:
+                    continue                  # 放不下完整素材：换一个，不截断
+            add(Seg(m.path, a0, n, 1.0, "clip" if m.kind == "video" else "image"), tr)
+            item_used |= ids
             picked += 1
+            if budget - used < int(fps * 1.0):
+                break
         if picked == 0 and order:
-            m = order[0]
-            n = min(self._clip_frames(m, rng), max(int(fps), budget - used))
-            start = self._usable_range(m)[0] if m.kind == "video" else 0.0
-            add(Seg(m.path, start, n, 1.0, "clip" if m.kind == "video" else "image"), None)
+            # 一个完整素材都放不下（素材都比上限长）：挑最短的一个，从开头截到上限，保留素材开头画面
+            m = min(order, key=lambda x: frames_of(x)[1])
+            a0, n = frames_of(m)
+            n = min(n, max(int(fps), budget - used))
+            add(Seg(m.path, a0, n, 1.0, "clip" if m.kind == "video" else "image"), None)
         if end_seg:
-            tr = self._choose_transition(rng)
-            if tr and tr[0] == "xfade":
-                left_ov = T if (len(trans) and trans[-1]) else 0
-                if segs[-1].frames < left_ov + T + MIN_BODY_FRAMES or end_seg.frames < T + MIN_BODY_FRAMES:
-                    tr = None
+            tr = self._whole_transition(rng)
+            if tr and used + T + end_seg.frames > cap:
+                tr = None
             add(end_seg, tr)
         return segs, trans
-
-    def _clean_pieces(self, m, rng, item_used, room, segs, trans, T):
-        """整段模式查重：返回 [(Seg, 转场)]。与本条已用画面重复的部分被删除，剩余部分按原顺序拼接（硬切）。"""
-        fps = self.fps
-        cfg = self.cfg
-        a, b = self._usable_range(m)
-        wins = [w for w in self.dup.clean_windows(m.path, a, b, item_used) if w[1] - w[0] >= 1.0]
-        if not wins:
-            return []
-        out = []
-        left = room
-        first = True
-        for ws, we in wins:
-            n = int(math.floor((we - ws) * fps)) - 1
-            if n < int(fps * 1.0):
-                continue
-            tr = self._choose_transition(rng) if (first and segs) else None
-            ov = T if (tr and tr[0] == "xfade") else 0
-            avail = left + ov
-            if n > avail:
-                if not cfg.trim_overflow or avail < max(int(fps * 1.0), MIN_BODY_FRAMES + 2 * T):
-                    break
-                n = avail
-            seg = Seg(m.path, round(ws, 3), n, 1.0, "clip")
-            if ov:
-                prev_seg = segs[-1]
-                left_ov = T if (len(trans) and trans[-1]) else 0
-                if prev_seg.frames < left_ov + T + MIN_BODY_FRAMES or seg.frames < 2 * T + MIN_BODY_FRAMES:
-                    tr = None
-                    ov = 0
-                    seg.frames = min(seg.frames, left)
-                    if seg.frames < int(fps * 1.0):
-                        break
-            out.append((seg, tr))
-            left -= seg.frames - ov
-            first = False
-            if left < int(fps * 1.0):
-                break
-        if out and sum(x[0].frames for x in out) < int(fps * 1.0):
-            return []
-        return out
 
     # ------------------------------------------------------------ 指纹/去重
     def _fingerprint(self, segs):
@@ -598,12 +573,14 @@ class Planner:
             else:
                 self.fingerprints.append(self._fingerprint(segs))
             self._commit_usage(segs)
-            nfr = total_frames(segs, trans, self.trans_frames)
+            hold = cfg.mode == "whole"
+            nfr = total_frames(segs, trans, self.trans_frames, hold)
             dur = nfr / float(fps)
             if limit > 0 and dur < limit * (1.0 - fpct) - 0.5:
                 short.append(dur)
             item = PlanItem(index=start_index + i, name="", segments=[asdict(s) for s in segs], transitions=trans,
-                            trans_frames=self.trans_frames, seed=seed_i, fps=fps, duration=round(dur, 3),
+                            trans_frames=self.trans_frames, trans_hold=hold, seed=seed_i, fps=fps,
+                            duration=round(dur, 3),
                             variant=int(cfg.variant_level or 0))
             # 滤镜
             if cfg.filter_mode == "fixed" and cfg.filter_choices:
@@ -638,7 +615,10 @@ class Planner:
             item.name = nm
             plans.append(item)
         if short:
-            why = "可用的不重复画面不足" if self.dup is not None else "素材时长不足"
+            if cfg.mode == "whole":
+                why = "完整素材凑不满时长（整段拼接不截断素材）"
+            else:
+                why = "可用的不重复画面不足" if self.dup is not None else "素材时长不足"
             self.warnings.append(f"有 {len(short)} 条成片因{why}而短于设定下限（最短 {min(short):.1f} 秒）。"
                                  f"可增加素材" + ("，或把查重灵敏度调为“宽松”" if self.dup is not None else ""))
         return plans, seed

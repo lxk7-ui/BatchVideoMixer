@@ -25,7 +25,7 @@ from . import overlays as ovl
 from .models import CleanupProfile, OverlayItem, StylePreset, Adjust
 from .planner import PlanItem, Seg
 
-PART_VERSION = 4
+PART_VERSION = 5
 AR = 48000  # 统一音频采样率
 COLOR_SET = "setparams=range=tv:color_primaries=bt709:color_trc=bt709:colorspace=bt709"
 
@@ -68,6 +68,7 @@ class RenderCtx:
     parts_dir: str
     enc: EncoderState
     threads: int = 4
+    final_threads: int = 0      # 最终合成编码线程数，0 = 由编码器自己决定
     cancel: object = None
     log: object = None
     stall_timeout: int = 240
@@ -209,16 +210,18 @@ def source_video_graph(inl, outl, rng_spec, ctx: RenderCtx, uid, workdir, effect
         parts.append(f"[{uid}fit]zoompan=z='{zexpr}':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)'"
                      f":d=1:s={W}x{H}:fps={fps},setsar=1[{uid}kb]")
         cur = f"[{uid}kb]"
-        post = []
+        post = [f"fps={fps}"]
     else:
         parts.append(fit_graph(cur, f"[{uid}fit]", info, W, H, ctx.fit, f"{uid}f", src_w=sw, src_h=sh))
         cur = f"[{uid}fit]"
         post = []
+        # 音画同步：输入跳转后画面和声音共用同一个时间零点，这里不能各自把起点归零（PTS-STARTPTS），
+        # 否则素材里声音比画面晚开始（录屏、手机视频常见）的那段时间差会丢掉，声音和字幕就对不上了
         if abs(speed - 1.0) > 1e-3:
-            post.append(f"setpts=(PTS-STARTPTS)/{speed:.5f}")
-        else:
-            post.append("setpts=PTS-STARTPTS")
-    post.append(f"fps={fps}")
+            post.append(f"setpts=PTS/{speed:.5f}")
+        post.append(f"fps={fps}:start_time=0")   # 画面比声音晚开始时，开头用第一帧补齐
+    if rng_spec.get("hold"):
+        post.append("trim=end_frame=1")          # 定格过渡：只取一帧，下面复制成整段
     post.append("tpad=stop_mode=clone:stop=-1")
     post.append(f"trim=end_frame={frames}")
     post.append(f"setpts=N/({fps}*TB)")
@@ -238,10 +241,12 @@ def source_audio_graph(inl, outl, rng_spec, ctx: RenderCtx, has_audio):
     dur = frames / float(ctx.fps)
     if not has_audio:
         return f"{inl}aformat=sample_fmts=s16:channel_layouts=stereo,atrim=end_sample={ns}{outl}"
-    chain = ["asetpts=PTS-STARTPTS"]
+    # 音画同步：与画面共用时间零点。声音晚开始时开头补静音；素材中途声音断档超过 0.1 秒时补静音，
+    # 否则后面的声音会整体提前，越往后和画面、字幕错得越多
+    chain = [f"aresample={AR}:async=1:min_hard_comp=0.1:first_pts=0"]
     if abs(speed - 1.0) > 1e-3:
         chain.append(_atempo_chain(speed))
-    chain += [f"aresample={AR}", "aformat=sample_fmts=s16:channel_layouts=stereo", "afade=t=in:d=0.012",
+    chain += ["asetpts=N/SR/TB", "aformat=sample_fmts=s16:channel_layouts=stereo", "afade=t=in:d=0.012",
               "apad", f"atrim=end_sample={ns}"]
     if dur > 0.05:
         chain.append(f"afade=t=out:st={max(0.0, dur - 0.015):.4f}:d=0.015")
@@ -258,8 +263,8 @@ def _input_args(rng_spec, ctx: RenderCtx):
     if info is not None and info.kind == "image":
         return ["-loop", "1", "-framerate", str(ctx.fps), "-t", f"{out_dur + 0.5:.3f}", "-i", src], False
     start = max(0.0, float(rng_spec.get("start") or 0))
-    need = out_dur * speed + 0.3
-    args = []
+    need = 0.5 if rng_spec.get("hold") else out_dur * speed + 0.3
+    args = ["-threads", str(ctx.threads)] if ctx.threads else []
     if start > 0.001:
         args += ["-ss", f"{start:.3f}"]
     args += ["-t", f"{need:.3f}", "-i", src]
@@ -276,6 +281,8 @@ def item_parts(item: PlanItem, ctx: RenderCtx):
     segs = item.seg_objs()
     T = int(item.trans_frames or 0)
     trans = list(item.transitions or [])
+    if getattr(item, "trans_hold", False):
+        return _hold_parts(item, segs, trans, T, fps)
     parts = []
     for i, s in enumerate(segs):
         left = T if (i > 0 and i - 1 < len(trans) and trans[i - 1]) else 0
@@ -294,6 +301,24 @@ def item_parts(item: PlanItem, ctx: RenderCtx):
             b = {"src": n.src, "speed": n.speed, "start": n.start, "frames": right, "kb_from": 0,
                  "kb_total": n.frames, "kb_dir": (item.seed + i + 1) % 2}
             parts.append({"kind": "junction", "a": a, "b": b, "transition": trans[i]})
+    return parts
+
+
+def _hold_parts(item, segs, trans, T, fps):
+    """整段拼接：每个素材完整渲染，不和相邻素材重叠；转场用前一段最后一帧和后一段第一帧做定格过渡，
+    素材本身一帧不少（转场会让成片多出转场时长）。"""
+    parts = []
+    for i, s in enumerate(segs):
+        base = {"src": s.src, "speed": s.speed, "kb_total": s.frames, "kb_dir": (item.seed + i) % 2}
+        parts.append({"kind": "body", "a": dict(base, start=s.start, frames=s.frames, kb_from=0), "effect": ""})
+        if i < len(segs) - 1 and i < len(trans) and trans[i] and T > 0:
+            n = segs[i + 1]
+            last = max(0, s.frames - 3)   # 往前留几帧余量，避免跳到素材末尾之后取不到画面
+            a = dict(base, start=round(s.start + last / fps * s.speed, 4), frames=T, kb_from=s.frames - 1,
+                     hold="last")
+            b = {"src": n.src, "speed": n.speed, "start": n.start, "frames": T, "kb_from": 0,
+                 "kb_total": n.frames, "kb_dir": (item.seed + i + 1) % 2, "hold": "first"}
+            parts.append({"kind": "junction", "a": a, "b": b, "transition": trans[i], "hold": True})
     return parts
 
 
@@ -367,7 +392,8 @@ def _render_part_locked(spec, ctx: RenderCtx, key, on_progress=None):
                      f"setpts=N/({ctx.fps}*TB),format=yuv420p,{COLOR_SET}[v]")
         ain_a = "[0:a]" if a_has_audio else f"[{idx_null}:a]"
         ain_b = "[1:a]" if b_has_audio else f"[{idx_null}:a]"
-        if not a_has_audio and not b_has_audio:
+        if spec.get("hold") or (not a_has_audio and not b_has_audio):
+            # 定格过渡：素材自己的声音已在前后两段里完整播放，过渡期间静音（有背景音乐时听不出来）
             graph.append(f"[{idx_null}:a]aformat=sample_fmts=s16:channel_layouts=stereo,"
                          f"atrim=end_sample={_nsamples(frames, ctx.fps)}[a]")
         else:
@@ -383,7 +409,8 @@ def _render_part_locked(spec, ctx: RenderCtx, key, on_progress=None):
     use_gpu = False
     venc = encoders.video_args(venc_name, purpose="intermediate", width=ctx.W, height=ctx.H, fps=ctx.fps,
                                threads=ctx.threads)
-    cmd = args + ffmpeg.filter_script_args(script) + ["-map", "[v]", "-map", "[a]"] + venc + \
+    fthreads = ["-filter_complex_threads", str(ctx.threads)] if ctx.threads else []
+    cmd = fthreads + args + ffmpeg.filter_script_args(script) + ["-map", "[v]", "-map", "[a]"] + venc + \
         encoders.COLOR_ARGS + ["-c:a", "pcm_s16le", "-ar", str(AR), "-frames:v", str(frames), tmp]
     dur = frames / float(ctx.fps)
 
@@ -401,7 +428,7 @@ def _render_part_locked(spec, ctx: RenderCtx, key, on_progress=None):
             ctx.enc.fallback(str(e)[:120])
             venc = encoders.video_args("cpu", purpose="intermediate", width=ctx.W, height=ctx.H, fps=ctx.fps,
                                        threads=ctx.threads)
-            cmd = args + ffmpeg.filter_script_args(script) + ["-map", "[v]", "-map", "[a]"] + venc + \
+            cmd = fthreads + args + ffmpeg.filter_script_args(script) + ["-map", "[v]", "-map", "[a]"] + venc + \
                 encoders.COLOR_ARGS + ["-c:a", "pcm_s16le", "-ar", str(AR), "-frames:v", str(frames), tmp]
             _run(cmd)
         else:
@@ -471,7 +498,9 @@ def compose(item: PlanItem, part_files, out_path, cfg, ctx: RenderCtx, on_progre
         for p in part_files:
             fh.write(ffmpeg.concat_list_line(p))
     rng = random.Random(item.seed + 101)
-    args = ["-reinit_filter", "0", "-f", "concat", "-safe", "0", "-i", lst]
+    nthreads = ctx.final_threads or 0
+    args = (["-filter_complex_threads", str(nthreads), "-threads", str(nthreads)] if nthreads else []) + \
+        ["-reinit_filter", "0", "-f", "concat", "-safe", "0", "-i", lst]
     graph = []
     next_idx = 1
     bgm_idx = None
@@ -533,7 +562,7 @@ def compose(item: PlanItem, part_files, out_path, cfg, ctx: RenderCtx, on_progre
                 f"comment=批量视频混剪工具 {datetime.now().strftime('%Y-%m-%d %H:%M')}"]
 
     def build_cmd(enc_name):
-        venc = encoders.video_args(enc_name, cfg.quality, W, H, fps, threads=None)
+        venc = encoders.video_args(enc_name, cfg.quality, W, H, fps, threads=nthreads or None)
         return args + ffmpeg.filter_script_args(script) + ["-map", "[vout]", "-map", "[aout]"] + venc + \
             encoders.COLOR_ARGS + ["-c:a", "aac", "-b:a", "192k", "-ar", str(AR), "-ac", "2",
                                    "-t", f"{D:.3f}", "-movflags", "+faststart"] + meta + [tmp]
@@ -562,33 +591,34 @@ def compose(item: PlanItem, part_files, out_path, cfg, ctx: RenderCtx, on_progre
 # ----------------------------------------------------------------------------
 # 成片复查后删除重复段
 # ----------------------------------------------------------------------------
-def output_boundaries(item: PlanItem, fps):
-    """成片时间轴上各片段的起止时刻（秒），用于把剪切点对齐到片段边界。"""
+def _layout(item: PlanItem, fps):
+    """成片时间轴上每个片段的 (起始帧, 结束帧, Seg)。叠化转场时相邻片段重叠 T 帧；
+    整段拼接的定格过渡不重叠，两段之间多出 T 帧。"""
     segs = item.seg_objs()
     T = int(item.trans_frames or 0)
     trans = list(item.transitions or [])
+    hold = bool(getattr(item, "trans_hold", False))
+    out = []
     t = 0
-    out = {0.0}
     for i, s in enumerate(segs):
-        end = t + s.frames
-        out.add(round(end / float(fps), 3))
-        if i < len(segs) - 1:
-            t = end - (T if (i < len(trans) and trans[i]) else 0)
-            out.add(round(t / float(fps), 3))
+        out.append((t, t + s.frames, s))
+        has = i < len(segs) - 1 and i < len(trans) and bool(trans[i])
+        t += s.frames + ((T if hold else -T) if has else 0)
+    return out
+
+
+def output_boundaries(item: PlanItem, fps):
+    """成片时间轴上各片段的起止时刻（秒），用于把剪切点对齐到片段边界。"""
+    out = {0.0}
+    for a, b, _s in _layout(item, fps):
+        out.add(round(a / float(fps), 3))
+        out.add(round(b / float(fps), 3))
     return sorted(out)
 
 
 def output_segments(item: PlanItem, fps):
-    """成片时间轴上每个片段的 (起, 止, Seg)（秒，含转场重叠），用于把成片时刻换算回素材时刻。"""
-    segs = item.seg_objs()
-    T = int(item.trans_frames or 0)
-    trans = list(item.transitions or [])
-    out = []
-    t = 0
-    for i, s in enumerate(segs):
-        out.append((t / float(fps), (t + s.frames) / float(fps), s))
-        t = t + s.frames - (T if (i < len(trans) and trans[i]) else 0)
-    return out
+    """成片时间轴上每个片段的 (起, 止, Seg)（秒），用于把成片时刻换算回素材时刻。"""
+    return [(a / float(fps), b / float(fps), s) for a, b, s in _layout(item, fps)]
 
 
 def remove_ranges(video, cuts, cfg, ctx: RenderCtx, duration):

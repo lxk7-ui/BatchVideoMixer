@@ -41,6 +41,9 @@ class MixPage(QWidget):
         self.t_start = 0
         self._build()
         last = settings.get().get("last_config")
+        if last and int(last.get("cfg_ver", 1) or 1) < 2:
+            # v1.2 起默认整段拼接（素材完整、不拆分），超出上限不再截断素材；旧版本保存的上次设置升级一次
+            last = dict(last, mode="whole", trim_overflow=False, cfg_ver=2)
         self.load_config(MixConfig.from_dict(last) if last else MixConfig(output_root=settings.output_root()))
         self.timer = QTimer(self)
         self.timer.setInterval(1000)
@@ -145,14 +148,14 @@ class MixPage(QWidget):
         l.addLayout(form_row("任务名称", self.name))
         self.count = ispin(1, 9999, 10, suffix=" 条", width=110)
         l.addLayout(form_row("生成数量", self.count))
-        self.mode_seg = QRadioButton("片段混剪（推荐：从各素材随机截取片段重新组合）")
-        self.mode_whole = QRadioButton("整段拼接（每条随机选几个完整素材拼接）")
+        self.mode_whole = QRadioButton("整段拼接（推荐：素材完整保留、不拆分，随机顺序拼接）")
+        self.mode_seg = QRadioButton("片段混剪（把素材拆成短片段重新组合，需要时再用）")
         g = QButtonGroup(self)
-        g.addButton(self.mode_seg)
         g.addButton(self.mode_whole)
+        g.addButton(self.mode_seg)
         mv = QVBoxLayout()
-        mv.addWidget(self.mode_seg)
         mv.addWidget(self.mode_whole)
+        mv.addWidget(self.mode_seg)
         l.addLayout(form_row("混剪模式", mv))
         self.mode_seg.toggled.connect(self._mode_changed)
         # 时长
@@ -163,6 +166,7 @@ class MixPage(QWidget):
         tc.add(form_row("", self.limit_on, "不超过", self.limit_min, label_w=0))
         tc.add(form_row("随机浮动", self.limit_float, "每条成片时长在 [上限×(1-浮动), 上限] 之间随机", label_w=64))
         self.limit_hint = QLabel()
+        self.limit_hint.setWordWrap(True)
         self.limit_hint.setStyleSheet(f"color: {theme.C['accent']};")
         tc.add(self.limit_hint)
         for wd in (self.limit_on,):
@@ -172,7 +176,7 @@ class MixPage(QWidget):
         l.addWidget(tc)
         dc = Card("防重复（素材是剪辑拼接过的必开）", margins=(12, 10, 12, 12))
         self.dedup_on = QCheckBox("剪辑前查重：识别素材之间 / 素材内部重复的画面，同一条成片里不重复使用")
-        self.dedup_post = QCheckBox("剪辑后复查：成片生成后再抽帧检查，发现重复片段自动剪掉")
+        self.dedup_post = QCheckBox("剪辑后复查：成片生成后抽帧检查，重复的素材或片段自动去掉")
         self.dedup_level = QComboBox()
         for k in ("standard", "strict", "loose"):
             self.dedup_level.addItem(dedup.LEVELS[k]["label"], k)
@@ -190,7 +194,7 @@ class MixPage(QWidget):
         l.addWidget(self.row_seg)
         self.clips_min = ispin(1, 50, 1, suffix=" 个", width=80)
         self.clips_max = ispin(1, 50, 3, suffix=" 个", width=80)
-        self.trim_overflow = QCheckBox("超出上限的素材自动截断")
+        self.trim_overflow = QCheckBox("放不下时截断素材结尾（一般不用）")
         self.row_clips = QWidget()
         rcl = form_row("每条素材数", self.clips_min, "~", self.clips_max, self.trim_overflow)
         self.row_clips.setLayout(rcl)
@@ -240,6 +244,8 @@ class MixPage(QWidget):
         self.trans_dur = dspin(0.2, 1.5, 0.5, 0.1, 1, " 秒", width=80)
         self.trans_prob = ispin(0, 100, 60, 10, " %", width=80)
         tc.add(form_row("转场时长", self.trans_dur, "出现概率", self.trans_prob, label_w=64))
+        tc.add(hint("整段拼接时，转场用前一个素材的最后一帧和后一个素材的第一帧做过渡，素材画面一帧不少"
+                    "（每个转场让成片多出转场时长）；“切换特效”会换成效果相近的过渡。"))
         self.xfade_list = CheckList([(k, v) for k, v in fl.XFADE_TYPES.items()], fl.DEFAULT_XFADE, columns_hint=96)
         self.xfade_list.setFixedHeight(130)
         self.effect_list = CheckList([(k, v) for k, v in fl.CUT_EFFECTS.items()], fl.DEFAULT_CUT_EFFECTS,
@@ -647,7 +653,8 @@ class MixPage(QWidget):
         if self.limit_on.isChecked() or seg:
             lo = lim * (1 - f)
             self.limit_hint.setText(f"→ 每条成片约 {utils.fmt_secs(lo)} ~ {utils.fmt_secs(lim)}"
-                                    f"（{lo:.0f}~{lim:.0f} 秒），绝不超过 {utils.fmt_secs(lim)}")
+                                    f"（{lo:.0f}~{lim:.0f} 秒），绝不超过 {utils.fmt_secs(lim)}"
+                                    + ("" if seg else "；只用放得下的完整素材，素材较长时成片可能短一些"))
             dtext = f"每条 {lo:.0f}~{lim:.0f} 秒"
         else:
             self.limit_hint.setText("→ 不限时长：时长随所选整段素材而定")

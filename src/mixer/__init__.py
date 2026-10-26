@@ -2,4 +2,4 @@
 
 APP_NAME = "批量视频混剪工具"
 APP_ID = "BatchVideoMixer"
-VERSION = "1.1.0"
+VERSION = "1.2.0"

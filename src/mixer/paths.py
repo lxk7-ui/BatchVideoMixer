@@ -59,13 +59,15 @@ def data_dir() -> str:
     global _DATA_DIR
     if _DATA_DIR:
         return _DATA_DIR
+    if not is_frozen():
+        # 开发态（源码运行、测试）只用工程里的 _work/data，绝不退回正式数据目录，避免测试弄脏使用者的数据
+        _DATA_DIR = os.path.join(project_root(), "_work", "data")
+        os.makedirs(_DATA_DIR, exist_ok=True)
+        return _DATA_DIR
     candidates = []
-    if is_frozen():
-        side = os.path.join(exe_dir(), "data")
-        if os.path.isdir(side) or os.path.isfile(os.path.join(exe_dir(), "portable.flag")):
-            candidates.append(side)
-    else:
-        candidates.append(os.path.join(project_root(), "_work", "data"))
+    side = os.path.join(exe_dir(), "data")
+    if os.path.isdir(side) or os.path.isfile(os.path.join(exe_dir(), "portable.flag")):
+        candidates.append(side)
     appdata = os.environ.get("APPDATA") or os.path.expanduser("~")
     candidates.append(os.path.join(appdata, APP_ID))
     for c in candidates:
